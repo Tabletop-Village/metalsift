@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Upstream CudaSift is fetched by scripts/fetch_cudasift.sh, not vendored:
+# it carries its own git history and ~16 MB of test images.
+/CudaSift/
