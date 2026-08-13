@@ -1,5 +1,4 @@
-"""Custom Metal kernels: the three data-dependent stages that can't be
-expressed as MLX ops, plus a small compaction pass.
+"""Custom Metal kernels for every stage of the pipeline.
 
 Ports of cudaSiftD.cu's FindPointsMultiNew, ComputeOrientationsCONST and
 ExtractSiftDescriptorsCONSTNew. Three CUDA features have no direct equivalent
@@ -371,8 +370,14 @@ FIND_POINTS = """
 # ComputeOrientationsCONST  (cudaSiftD.cu:972)
 # 128 threads instead of CUDA's 121: the yd<11 guard already excludes the
 # extra 7, so the result is identical and the threadgroup stays simd-aligned.
-# Writes one slot per keypoint, so no aliasing -- the duplicate keypoints that
-# CUDA appends in-place are emitted as `orient2` and compacted separately.
+#
+# CUDA appends the extra keypoints for secondary orientation peaks into the
+# very buffer it is reading from, while other threadgroups are still reading
+# it. That hazard does not exist here: `kp` is a const input and `kp_out` is a
+# distinct output buffer, so this kernel can read one and append to the other
+# freely. Within kp_out, the copy region [0, n0) and the append region
+# [n0, maxPts) are disjoint by construction, since the append index is always
+# n0 + atomic_fetch_add.
 # ---------------------------------------------------------------------------
 ORIENTATIONS = """
     threadgroup atomic_uint hist_a[32];
@@ -445,41 +450,32 @@ ORIENTATIONS = """
             float a1 = hist[32 + ((i1 + 1) & 31)];
             float a2 = hist[32 + ((i1 + 31) & 31)];
             float peak = float(i1) + 0.5f * (a1 - a2) / (2.0f * maxval1 - a1 - a2);
-            orient[bx] = 11.25f * (peak < 0.0f ? peak + 32.0f : peak);
+
+            for (int c = 0; c < 6; c++)
+                atomic_store_explicit(&kp_out[bx * 7 + c], kp[bx * 6 + c],
+                                      memory_order_relaxed);
+            atomic_store_explicit(&kp_out[bx * 7 + 6],
+                                  11.25f * (peak < 0.0f ? peak + 32.0f : peak),
+                                  memory_order_relaxed);
+
             if (maxval2 > 0.8f * maxval1) {
                 float b1 = hist[32 + ((i2 + 1) & 31)];
                 float b2 = hist[32 + ((i2 + 31) & 31)];
                 float pk2 = float(i2) + 0.5f * (b1 - b2) / (2.0f * maxval2 - b1 - b2);
-                orient2[bx] = 11.25f * (pk2 < 0.0f ? pk2 + 32.0f : pk2);
+                uint idx = totPts + atomic_fetch_add_explicit(&dup[0], 1u,
+                                                              memory_order_relaxed);
+                if (idx < uint(maxPts)) {
+                    for (int c = 0; c < 6; c++)
+                        atomic_store_explicit(&kp_out[idx * 7 + c], kp[bx * 6 + c],
+                                              memory_order_relaxed);
+                    atomic_store_explicit(&kp_out[idx * 7 + 6],
+                                          11.25f * (pk2 < 0.0f ? pk2 + 32.0f : pk2),
+                                          memory_order_relaxed);
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-"""
-
-# ---------------------------------------------------------------------------
-# Compaction pass replacing CudaSift's in-place duplicate append.
-# Copy region [0, n0) and append region [n0, ...) are disjoint by construction,
-# so a single kernel can do both without a read/write hazard on one buffer.
-# ---------------------------------------------------------------------------
-APPEND_DUPES = """
-    uint i = thread_position_in_grid.x;
-    uint maxPts = uint(ip[2]);
-    if (i >= maxPts) return;
-    uint n0 = metal::min(cnt[0], maxPts);
-    if (i >= n0) return;
-
-    for (int c = 0; c < 6; c++)
-        atomic_store_explicit(&kp_out[i * 7 + c], kp_in[i * 6 + c], memory_order_relaxed);
-    atomic_store_explicit(&kp_out[i * 7 + 6], orient[i], memory_order_relaxed);
-
-    float o2 = orient2[i];
-    if (o2 < 0.0f) return;
-    uint idx = n0 + atomic_fetch_add_explicit(&dup[0], 1u, memory_order_relaxed);
-    if (idx >= maxPts) return;
-    for (int c = 0; c < 6; c++)
-        atomic_store_explicit(&kp_out[idx * 7 + c], kp_in[i * 6 + c], memory_order_relaxed);
-    atomic_store_explicit(&kp_out[idx * 7 + 6], o2, memory_order_relaxed);
 """
 
 # ---------------------------------------------------------------------------
@@ -596,9 +592,7 @@ _scaledown = _k("scale_down", ["img", "k", "ip"], ["out"], SCALEDOWN)
 _laplace = _k("laplace_multi", ["img", "k", "ip"], ["dog"], LAPLACE)
 _find = _k("find_points", ["dog", "ip", "fp"], ["kp", "cnt"], FIND_POINTS, atomic=True)
 _orient = _k("compute_orientations", ["img", "kp", "cnt", "ip"],
-             ["orient", "orient2"], ORIENTATIONS)
-_append = _k("append_dupes", ["kp_in", "orient", "orient2", "cnt", "ip"],
-             ["kp_out", "dup"], APPEND_DUPES, atomic=True)
+             ["kp_out", "dup"], ORIENTATIONS, atomic=True)
 _desc = _k("descriptors", ["img", "kp", "cnt", "ip"], ["desc"], DESCRIPTORS)
 
 
@@ -666,28 +660,22 @@ def find_points(dog, w, h, max_pts, subsampling, lowest_scale, thresh,
 
 
 def compute_orientations(img, kp, cnt, w, h, max_pts):
+    """Assign orientations and emit the (maxPts, 7) keypoint array.
+
+    Also appends a keypoint for every secondary orientation peak, which
+    CudaSift does in a second pass over the shared buffer. Returns
+    (kp_out, total) with total on device, so no sync is needed mid-pipeline.
+    """
     ip = mx.array([w, h, max_pts], dtype=mx.int32)
-    return _orient(
+    kp_out, dup = _orient(
         inputs=[img, kp, cnt, ip],
         grid=(128 * NBLK, 1, 1), threadgroup=(128, 1, 1),
-        output_shapes=[(max_pts,), (max_pts,)],
-        output_dtypes=[mx.float32, mx.float32],
-        init_value=-1.0,
-    )
-
-
-def append_dupes(kp, orient, orient2, cnt, w, h, max_pts):
-    ip = mx.array([w, h, max_pts], dtype=mx.int32)
-    kp_out, dup = _append(
-        inputs=[kp, orient, orient2, cnt, ip],
-        grid=(_idiv(max_pts, 256) * 256, 1, 1), threadgroup=(256, 1, 1),
         output_shapes=[(max_pts, 7), (1,)],
         output_dtypes=[mx.float32, mx.uint32],
         init_value=0,
     )
-    # total for this octave, kept on device so no sync is needed mid-pipeline
-    total = mx.minimum(cnt, mx.array([max_pts], dtype=mx.uint32)) + dup
-    return kp_out, mx.minimum(total, mx.array([max_pts], dtype=mx.uint32))
+    cap = mx.array([max_pts], dtype=mx.uint32)
+    return kp_out, mx.minimum(mx.minimum(cnt, cap) + dup, cap)
 
 
 def descriptors(img, kp, cnt, w, h, max_pts):

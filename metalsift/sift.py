@@ -57,10 +57,8 @@ def extract_sift(img, num_octaves=5, init_blur=1.0, thresh=3.0,
             dog, w, h, max_pts_per_octave, subsampling,
             lowest_scale / subsampling, thresh, 1.0 / NUM_SCALES, EDGE_LIMIT)
 
-        orient, orient2 = msl.compute_orientations(
+        kp7, total = msl.compute_orientations(
             oimg, kp, cnt, w, h, max_pts_per_octave)
-        kp7, total = msl.append_dupes(
-            kp, orient, orient2, cnt, w, h, max_pts_per_octave)
 
         desc = msl.descriptors(oimg, kp7, total, w, h, max_pts_per_octave)
 

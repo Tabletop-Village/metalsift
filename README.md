@@ -58,8 +58,7 @@ CudaSift reports 1.7 ms on a GTX 1060 and 0.80 ms on a 1080 Ti — but its
 published figures exclude LowPass, which it treats as preprocessing, so 2.63 ms
 is the comparable number.
 
-Per stage, summed over all five octaves. Each is measured with its own sync, so
-they total more than the pipeline itself — lazy evaluation overlaps them:
+Per stage, summed over all five octaves:
 
 | stage | ms |
 |---|---|
@@ -67,9 +66,17 @@ they total more than the pipeline itself — lazy evaluation overlaps them:
 | 4x ScaleDown | 0.22 |
 | LaplaceMulti (DoG) | 1.94 |
 | FindPointsMulti | 1.14 |
-| ComputeOrientations | 0.74 |
-| duplicate compaction | 0.78 |
+| ComputeOrientations (incl. duplicate append) | 0.75 |
 | ExtractSiftDescriptors | 0.99 |
+
+**These sum to 5.4 ms against a 3.0 ms pipeline, and the difference is not
+overlap — it is measurement cost.** Each figure is taken with its own
+`mx.eval`, and a sync costs roughly 0.2 ms that the real pipeline never pays,
+because MLX batches dispatches into command buffers. So per-stage numbers are
+useful for comparing two implementations of the *same* stage, and actively
+misleading for predicting what removing a stage will save. Merging the
+orientation and compaction passes cut their combined per-stage cost from
+1.52 ms to 0.75 ms and changed end-to-end time by nothing at all.
 
 Everything above runs in hand-written Metal. Host-side orchestration in Python
 costs **0.07 ms**, constant regardless of image size, so rewriting the driver in
@@ -79,8 +86,8 @@ C++ would recover about 1% — see "Why not C++" below.
 
 ```
 metalsift/pyramid.py   scale-space as MLX ops (LowPass, ScaleDown, ScaleUp)
-metalsift/msl.py       Metal kernels: LaplaceMulti, FindPoints, Orientations,
-                       compaction, Descriptors
+metalsift/msl.py       Metal kernels: LowPass, ScaleDown, LaplaceMulti,
+                       FindPoints, Orientations, Descriptors
 metalsift/sift.py      the ExtractSift / ExtractSiftLoop / ExtractSiftOctave pipeline
 metalsift/matching.py  matching and RANSAC homography, pure MLX ops
 ```
@@ -113,11 +120,13 @@ the whole extraction.
 
 A related hazard the counter chain hides: `ComputeOrientationsCONST` appends
 *new* keypoints for secondary orientation peaks into the same buffer it is
-reading from, while other threadgroups are still reading it. MLX inputs are
-const and outputs are distinct buffers, so this is split — the orientation
-kernel emits a second orientation per slot, and a separate compaction pass
-copies `[0, n)` and appends duplicates at `>= n`. The two regions are disjoint
-by construction, so one kernel does both without aliasing.
+reading from, while other threadgroups are still reading it. In MLX that hazard
+simply does not exist — `kp` is a const input and `kp_out` a distinct output
+buffer, so the kernel reads one and appends to the other. Within `kp_out` the
+copy region `[0, n)` and the append region `[n, maxPts)` are disjoint by
+construction, since the append index is always `n + atomic_fetch_add`. The
+constraint that looked like the hardest part of the port turned out to remove
+the problem rather than create one.
 
 ## Deviations from CudaSift
 
