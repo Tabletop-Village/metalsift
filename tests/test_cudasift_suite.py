@@ -267,6 +267,11 @@ def test_stereo_pair():
 
 
 def main():
+    if not os.path.isdir(DATA):
+        print("SKIP: CudaSift test images not found.\n"
+              "      Run ./scripts/fetch_cudasift.sh to fetch them.")
+        return 0
+
     print("=== test_extract.cpp (10 checks) ===")
     test_basic_extraction()
     test_different_thresholds()

@@ -106,8 +106,20 @@ def _empty():
 
 def load_gray(path):
     """Read an image as a (H, W) float32 MLX array with 0-255 intensities,
-    matching mainSift.cpp's cv::imread(..., 0).convertTo(CV_32FC1)."""
-    import cv2
+    matching mainSift.cpp's cv::imread(..., 0).convertTo(CV_32FC1).
+
+    This is the only part of the package that needs OpenCV, which is why it is
+    an optional dependency and imported here rather than at module scope.
+    """
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "load_gray needs OpenCV, an optional dependency. Install it with: "
+            "pip install 'metalsift[io]'  -- or decode the image yourself and "
+            "pass a (H, W) float32 mlx array with 0-255 intensities to "
+            "extract_sift()."
+        ) from exc
     im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if im is None:
         raise FileNotFoundError(path)

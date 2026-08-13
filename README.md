@@ -8,7 +8,26 @@ is distributed under the same MIT licence with that copyright notice retained.
 The algorithm, kernel structure and parameter choices are his; what is new here
 is the Metal/MLX implementation.
 
-## Setup
+## Install
+
+```
+pip install metalsift            # Apple Silicon only -- there is no CPU fallback
+pip install 'metalsift[io]'      # adds OpenCV, needed only for load_gray()
+```
+
+```python
+import metalsift, mlx.core as mx
+kp1 = metalsift.extract_sift(img1)          # img: (H, W) float32 mlx array, 0-255
+kp2 = metalsift.extract_sift(img2)
+m = metalsift.match(kp1["desc"], kp2["desc"], kp2["xy"])
+H, n = metalsift.find_homography(kp1["xy"], m)
+```
+
+The wheel is pure Python — the Metal shaders are strings that MLX compiles at
+runtime — but it is tagged `macosx_11_0_arm64` so pip declines it on machines
+with no Metal GPU rather than installing and failing later.
+
+## Developing
 
 Upstream CudaSift is not vendored — its `data/` images are what everything runs
 against, and `cudaSiftD.cu` is what the port is line-referenced to:

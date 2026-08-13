@@ -170,6 +170,11 @@ def test_vs_opencv(s1, s2, im1, im2):
 
 
 def main():
+    if not os.path.isdir(DATA):
+        print("SKIP: CudaSift test images not found.\n"
+              "      Run ./scripts/fetch_cudasift.sh to fetch them.")
+        return 0
+
     img1 = load_gray(os.path.join(DATA, "img1.png"))
     img2 = load_gray(os.path.join(DATA, "img2.png"))
     im1 = cv2.imread(os.path.join(DATA, "img1.png"), 0)

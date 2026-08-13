@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "metalsift"
+dynamic = ["version"]
+description = "SIFT feature extraction on Apple Silicon: a port of CudaSift to MLX + Metal"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Tabletop Village" }]
+keywords = [
+    "sift", "metal", "mlx", "apple-silicon",
+    "computer-vision", "feature-detection", "gpu",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Multimedia :: Graphics",
+]
+
+# mlx is pinned at the version the port was developed and tested against; the
+# custom-kernel API (atomic_outputs, init_value) is not covered by any
+# stability guarantee, so widen this only after testing against an older mlx.
+dependencies = [
+    "mlx>=0.32",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# Only metalsift.sift.load_gray needs OpenCV; the core never imports it.
+io = ["opencv-python-headless>=4.8"]
+test = ["opencv-python-headless>=4.8"]
+
+[project.urls]
+Homepage = "https://github.com/Tabletop-Village/metalsift"
+Repository = "https://github.com/Tabletop-Village/metalsift"
+Issues = "https://github.com/Tabletop-Village/metalsift/issues"
+Upstream = "https://github.com/Celebrandil/CudaSift"
+
+[tool.hatch.version]
+# regex-scraped, not imported -- importing would trip the Metal check below
+path = "metalsift/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["metalsift"]
+
+# The wheel is pure Python, but it only runs on a Metal GPU. Tagging it for
+# macOS arm64 makes pip refuse it elsewhere rather than installing happily and
+# failing later inside kernel compilation. See hatch_build.py.
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["metalsift", "tests", "scripts", "demo.py", "README.md", "LICENSE"]
