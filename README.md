@@ -3,6 +3,11 @@
 A port of [CudaSift](https://github.com/Celebrandil/CudaSift) (Pascal branch, MIT)
 to Apple Silicon via MLX + custom Metal kernels. Built and measured on an M5.
 
+This is a derivative work of CudaSift, copyright (c) 2017 Mårten Björkman, and
+is distributed under the same MIT licence with that copyright notice retained.
+The algorithm, kernel structure and parameter choices are his; what is new here
+is the Metal/MLX implementation.
+
 ## Setup
 
 Upstream CudaSift is not vendored — its `data/` images are what everything runs

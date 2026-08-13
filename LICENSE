@@ -1,11 +1,7 @@
 MIT License
 
-This project is a port of CudaSift (https://github.com/Celebrandil/CudaSift),
-and is a derivative work of it. The original copyright notice is retained below
-as required by its licence.
-
-Copyright (c) 2017 Mårten Björkman (CudaSift, original work)
-Copyright (c) 2026 Tabletop Village (metalSIFT, Metal/MLX port)
+Copyright (c) 2017 Mårten Björkman
+Copyright (c) 2026 Tabletop Village
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
