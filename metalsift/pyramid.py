@@ -119,7 +119,13 @@ def separable(img, taps, stride=1):
 
 
 def lowpass(img, scale):
-    """LowPassBlock (cudaSiftD.cu:1986)."""
+    """LowPassBlock (cudaSiftD.cu:1986) as MLX ops.
+
+    Reference implementation; msl.lowpass is what the pipeline uses. Two
+    compiled passes cost 1.26 ms at 1920x1080 against 0.35 ms fused, because
+    the row pass writes a full-resolution intermediate the column pass reads
+    straight back.
+    """
     return separable(img, lowpass_taps(scale))
 
 
@@ -129,6 +135,9 @@ def scale_down(img, taps):
     Output pixel (u, v) is the 5-tap response centred on input (2u, 2v), which
     is what the shared-memory version computes; there is no half-pixel shift.
     Trailing odd row/column is dropped, as CudaSift does via width/2.
+
+    Reference implementation; msl.scale_down is what the pipeline uses
+    (1.24 ms vs 0.19 ms for the four pyramid levels at 1920x1080).
     """
     return separable(img, taps, stride=2)
 

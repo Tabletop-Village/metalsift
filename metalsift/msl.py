@@ -69,6 +69,104 @@ inline float FastAtan2(float y, float x) {
 """
 
 # ---------------------------------------------------------------------------
+# LowPassBlock (cudaSiftD.cu:1986) and ScaleDown (cudaSiftD.cu:84).
+#
+# Both are separable symmetric filters with clamp-to-edge, and both were
+# initially MLX ops. As two compiled shift-multiply-add passes they cost
+# 1.30 ms and 1.22 ms at 1920x1080 -- together half the whole extraction --
+# because each pass writes a full-resolution intermediate that the next pass
+# reads back.
+#
+# Fusing removes that round trip. Each threadgroup owns a strip of ROWS output
+# rows: it does the vertical pass in registers with a sliding window, parks one
+# row of partials in threadgroup memory, and finishes horizontally from there.
+# Handling 8 rows at once amortises the vertical halo -- a threadgroup reads
+# ROWS+8 input rows to produce ROWS outputs, so read amplification is ~2x
+# rather than the 9x it would be one row at a time.
+#
+# CudaSift's LowPassBlock instead does its horizontal pass with warp shuffles
+# across a 32-lane row, which costs it 8 of every 32 lanes to the halo. Not
+# reproduced: the threadgroup-memory form here is simpler and wastes less.
+# ---------------------------------------------------------------------------
+LP_W, LP_R, LP_ROWS = 128, 4, 8
+SD_OW, SD_R, SD_ROWS = 64, 2, 8
+
+LOWPASS = """
+    threadgroup float buff[(128 + 8) * 8];
+    const int width = ip[0], height = ip[1];
+    const int stride = 128 + 8;
+
+    int tx = int(thread_position_in_threadgroup.x);
+    int xp = int(threadgroup_position_in_grid.x) * 128 + tx;
+    int y0 = int(threadgroup_position_in_grid.y) * 8;
+
+    if (xp < width + 8) {
+        int col = metal::max(metal::min(xp - 4, width - 1), 0);
+        float temp[8 + 8];
+        for (int i = 0; i < 16; i++)
+            temp[i] = img[metal::max(metal::min(y0 + i - 4, height - 1), 0) * width + col];
+        for (int r = 0; r < 8; r++) {
+            float sum = k[4] * temp[r + 4];
+            for (int j = 1; j <= 4; j++)
+                sum += k[4 + j] * (temp[r + 4 - j] + temp[r + 4 + j]);
+            buff[r * stride + tx] = sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tx < 128 && xp < width) {
+        for (int r = 0; r < 8; r++) {
+            int y = y0 + r;
+            if (y >= height) break;
+            threadgroup float *b = buff + r * stride;
+            float sum = k[4] * b[tx + 4];
+            for (int j = 1; j <= 4; j++)
+                sum += k[4 + j] * (b[tx + 4 - j] + b[tx + 4 + j]);
+            out[y * width + xp] = sum;
+        }
+    }
+"""
+
+SCALEDOWN = """
+    threadgroup float buff[(2 * 64 + 4) * 8];
+    const int width = ip[0], height = ip[1];       /* input dims */
+    const int ow = width / 2, oh = height / 2;
+    const int stride = 2 * 64 + 4;
+
+    int tx = int(thread_position_in_threadgroup.x);
+    int cbase = int(threadgroup_position_in_grid.x) * 128;
+    int v0 = int(threadgroup_position_in_grid.y) * 8;
+
+    /* thread tx holds input column cbase + tx - 2 */
+    int col = metal::max(metal::min(cbase + tx - 2, width - 1), 0);
+    float temp[2 * 8 + 4];
+    for (int i = 0; i < 20; i++)
+        temp[i] = img[metal::max(metal::min(2 * v0 + i - 2, height - 1), 0) * width + col];
+    /* output row v0+r is centred on input row 2*(v0+r) -> temp[2r .. 2r+4] */
+    for (int r = 0; r < 8; r++) {
+        float sum = 0.0f;
+        for (int j = 0; j < 5; j++)
+            sum += k[j] * temp[2 * r + j];
+        buff[r * stride + tx] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int u = int(threadgroup_position_in_grid.x) * 64 + tx;
+    if (tx < 64 && u < ow) {
+        for (int r = 0; r < 8; r++) {
+            int v = v0 + r;
+            if (v >= oh) break;
+            threadgroup float *b = buff + r * stride;
+            float sum = 0.0f;
+            for (int j = 0; j < 5; j++)
+                sum += k[j] * b[2 * tx + j];
+            out[v * ow + u] = sum;
+        }
+    }
+"""
+
+
+# ---------------------------------------------------------------------------
 # LaplaceMultiMem  (cudaSiftD.cu:1753)
 # Expressible as MLX ops, but not efficiently: a depthwise mx.conv2d over the
 # 8 scales runs 18.7 ms at 1920x1080, and even a compiled shift-multiply-add
@@ -493,6 +591,8 @@ def _k(name, inputs, outputs, source, atomic=False):
     )
 
 
+_lowpass = _k("lowpass", ["img", "k", "ip"], ["out"], LOWPASS)
+_scaledown = _k("scale_down", ["img", "k", "ip"], ["out"], SCALEDOWN)
 _laplace = _k("laplace_multi", ["img", "k", "ip"], ["dog"], LAPLACE)
 _find = _k("find_points", ["dog", "ip", "fp"], ["kp", "cnt"], FIND_POINTS, atomic=True)
 _orient = _k("compute_orientations", ["img", "kp", "cnt", "ip"],
@@ -504,6 +604,34 @@ _desc = _k("descriptors", ["img", "kp", "cnt", "ip"], ["desc"], DESCRIPTORS)
 
 def _idiv(a, b):
     return (a + b - 1) // b
+
+
+def lowpass(img, taps):
+    """taps: (9,) float32 MLX array. Returns (h, w), same shape as img."""
+    h, w = img.shape
+    ip = mx.array([w, h], dtype=mx.int32)
+    (out,) = _lowpass(
+        inputs=[img, taps, ip],
+        grid=((LP_W + 2 * LP_R) * _idiv(w, LP_W), _idiv(h, LP_ROWS), 1),
+        threadgroup=(LP_W + 2 * LP_R, 1, 1),
+        output_shapes=[(h, w)], output_dtypes=[mx.float32], init_value=0.0,
+    )
+    return out
+
+
+def scale_down(img, taps):
+    """taps: (5,) float32 MLX array. Returns (h//2, w//2)."""
+    h, w = img.shape
+    ip = mx.array([w, h], dtype=mx.int32)
+    (out,) = _scaledown(
+        inputs=[img, taps, ip],
+        grid=((2 * SD_OW + 2 * SD_R) * _idiv(w // 2, SD_OW),
+              _idiv(h // 2, SD_ROWS), 1),
+        threadgroup=(2 * SD_OW + 2 * SD_R, 1, 1),
+        output_shapes=[(h // 2, w // 2)], output_dtypes=[mx.float32],
+        init_value=0.0,
+    )
+    return out
 
 
 def laplace_multi(img, taps, w, h):

@@ -50,22 +50,30 @@ mise exec -- python tests/probe_msl.py             # which MSL primitives compil
 
 | stage | ms |
 |---|---|
-| **full extraction** | **5.44** |
-| matching, 2061 x 2240 descriptors | 1.47 |
+| **full extraction** | **3.02** |
+| ... excluding LowPass, CudaSift's benchmark basis | 2.63 |
+| matching, 2061 x 2240 descriptors | 0.70 |
 
-Per stage, summed over all five octaves (each measured with its own sync, so
-these sum to more than the pipeline total — lazy evaluation overlaps them):
+CudaSift reports 1.7 ms on a GTX 1060 and 0.80 ms on a 1080 Ti — but its
+published figures exclude LowPass, which it treats as preprocessing, so 2.63 ms
+is the comparable number.
 
-| stage | ms | where |
-|---|---|---|
-| LowPass + 5x ScaleDown | 2.36 | MLX ops |
-| LaplaceMulti (DoG) | 1.91 | Metal |
-| FindPointsMulti | 1.38 | Metal |
-| ComputeOrientations | 0.68 | Metal |
-| duplicate compaction | 0.86 | Metal |
-| ExtractSiftDescriptors | 0.90 | Metal |
+Per stage, summed over all five octaves. Each is measured with its own sync, so
+they total more than the pipeline itself — lazy evaluation overlaps them:
 
-For reference, CudaSift reports 1.7 ms at this resolution on a GTX 1080 Ti.
+| stage | ms |
+|---|---|
+| LowPass | 0.39 |
+| 4x ScaleDown | 0.22 |
+| LaplaceMulti (DoG) | 1.94 |
+| FindPointsMulti | 1.14 |
+| ComputeOrientations | 0.74 |
+| duplicate compaction | 0.78 |
+| ExtractSiftDescriptors | 0.99 |
+
+Everything above runs in hand-written Metal. Host-side orchestration in Python
+costs **0.07 ms**, constant regardless of image size, so rewriting the driver in
+C++ would recover about 1% — see "Why not C++" below.
 
 ## Layout
 
@@ -133,12 +141,21 @@ by construction, so one kernel does both without aliasing.
 
 **`mx.conv2d` is the wrong tool for separable filters.** At 1920x1080 a
 9-tap depthwise `conv2d` over 8 channels takes **18.7 ms**, and even a
-single-channel 9-tap pass takes 2.4 ms. The same filter written as fused
-shifted multiply-adds under `mx.compile` takes 1.26 ms, and the custom Metal
-port of `LaplaceMultiMem` takes **1.11 ms**. Building the DoG pyramid from
-`conv2d` — the obvious pure-MLX approach — cost 38 of the original 45 ms.
-`LowPass`/`ScaleDown` still use the compiled shift form; only the 8-scale DoG
-justified a custom kernel.
+single-channel 9-tap pass takes 2.4 ms. Building the DoG pyramid from `conv2d`
+— the obvious pure-MLX approach — cost 38 of the original 45 ms.
+
+Rewriting as fused shifted multiply-adds under `mx.compile` helps a lot, but
+still writes a full-resolution intermediate between the row and column passes.
+Every separable stage ended up worth a custom kernel:
+
+| stage | conv2d | compiled shifts | Metal kernel |
+|---|---|---|---|
+| LaplaceMulti (8 scales) | 18.7 ms | 7.9 ms | **1.11 ms** |
+| LowPass | 4.6 ms | 1.26 ms | **0.35 ms** |
+| 4x ScaleDown | — | 1.24 ms | **0.19 ms** |
+
+The ops versions are kept in `pyramid.py` as references, and the test suite
+checks each kernel against them.
 
 **`mx.matmul` is not full float32 on the GPU.** It dispatches to a
 reduced-precision hardware path: ~8e-4 relative error, versus 4e-7 for the same
@@ -188,6 +205,28 @@ One assertion — "all ambiguity values in [0, 1]" — genuinely failed at first
 and caught a real bug: matching ranks with the fast GEMM but rescores the top
 two exactly, and on a near-tie the exact rescore could invert the pair, pushing
 the ratio just above 1. Fixed by re-ordering after the rescore.
+
+## Why not C++
+
+Rewriting the host side in compiled code would buy almost nothing, because
+there is no interpreted hot loop to remove. Every kernel is already compiled
+Metal; Python only builds the dispatch graph. Timing the two separately:
+
+| image | Mpix | Python build | GPU eval |
+|---|---|---|---|
+| 512x512 | 0.26 | 0.09 ms | 1.36 ms |
+| 1024x1024 | 1.05 | 0.07 ms | 3.17 ms |
+| 1920x1080 | 2.07 | 0.07 ms | 5.52 ms |
+
+(measured before the LowPass/ScaleDown kernels landed). Python is flat at
+0.07 ms; GPU time fits `2.28 ms/Mpix + 0.78 ms`. That 0.78 ms fixed cost covers
+~25 kernel dispatches, which also shows MLX batches them into command buffers:
+a single isolated kernel round trip costs 193 us, so 25 unbatched dispatches
+would alone be 4.8 ms.
+
+For streaming work it is better still — MLX dispatches asynchronously, so the
+next frame's graph builds while the current one runs, hiding the 0.07 ms
+entirely.
 
 ## How correctness was otherwise established
 

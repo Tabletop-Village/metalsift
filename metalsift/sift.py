@@ -31,16 +31,21 @@ def extract_sift(img, num_octaves=5, init_blur=1.0, thresh=3.0,
     # Prefilter, then build the octave base images by successive ScaleDown.
     # ExtractSiftLoop recurses down before processing, so octave index 1 is the
     # smallest image and num_octaves is full resolution.
-    base = P.lowpass(img, max(init_blur, 0.001))
-    sd_taps = P.scaledown_taps(0.5)
+    base = msl.lowpass(img, mx.array(P.lowpass_taps(max(init_blur, 0.001))))
+    sd_taps = mx.array(P.scaledown_taps(0.5))
     bases = {num_octaves: base}
     for o in range(num_octaves - 1, 0, -1):
-        bases[o] = P.scale_down(bases[o + 1], sd_taps)
+        h, w = bases[o + 1].shape
+        if w < 4 or h < 4:
+            break
+        bases[o] = msl.scale_down(bases[o + 1], sd_taps)
 
     lap = {o: mx.array(k) for o, k in P.laplace_taps(num_octaves, 0.0).items()}
     per_octave = []
 
     for o in range(1, num_octaves + 1):
+        if o not in bases:
+            continue
         oimg = bases[o]
         h, w = oimg.shape
         if w < 32 or h < 16:

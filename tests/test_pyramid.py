@@ -55,9 +55,9 @@ def main():
     check("lowpass(sigma=1.0)", P.lowpass(mimg, 1.0), ref_separable(img, taps))
 
     # ScaleDown
-    st = P.scaledown_taps(0.5)
-    ref = ref_separable(img, st, stride=2)[: 97 // 2, : 131 // 2]
-    check("scale_down", P.scale_down(mimg, st), ref)
+    st_np = P.scaledown_taps(0.5)
+    ref = ref_separable(img, st_np, stride=2)[: 97 // 2, : 131 // 2]
+    check("scale_down", P.scale_down(mimg, st_np), ref)
 
     # LaplaceMulti: all 8 blurs and the 7 differences.
     # The DoG is a difference of two ~200-magnitude blurs, so it loses ~2
@@ -75,8 +75,22 @@ def main():
     if not ok:
         fails.append("laplace_multi")
 
-    # The fused Metal kernel must agree with the ops formulation
+    # The fused Metal kernels must agree with the ops formulation. Odd
+    # dimensions are the interesting case: they exercise the tail guards in
+    # both the halo load and the output write.
     from metalsift import msl
+    lt, st = mx.array(taps), mx.array(P.scaledown_taps(0.5))
+    for name, got, want in (
+        ("msl.lowpass", msl.lowpass(mimg, lt), P.lowpass(mimg, 1.0)),
+        ("msl.scale_down", msl.scale_down(mimg, st), P.scale_down(mimg, st_np)),
+    ):
+        got, want = np.asarray(got), np.asarray(want)
+        ok = got.shape == want.shape and rel_err(got, want) < 2e-6
+        print(f"  {name + ' vs ops':<34} {'PASS' if ok else 'FAIL'}  "
+              f"rel_err={rel_err(got, want):.3e} shape={got.shape}")
+        if not ok:
+            fails.append(name)
+
     msl_dog = np.asarray(msl.laplace_multi(mimg, mx.array(kern), 131, 97))
     u2 = np.abs(msl_dog - dog).max() / (np.finfo(np.float32).eps * np.abs(blurs).max())
     ok2 = u2 < 8
@@ -89,7 +103,7 @@ def main():
     # half-pixel shift -- the thing that silently drifts keypoints if wrong.
     imp = np.zeros((32, 32), np.float32)
     imp[10, 14] = 1.0
-    d = np.asarray(P.scale_down(mx.array(imp), st))
+    d = np.asarray(P.scale_down(mx.array(imp), st_np))
     peak = np.unravel_index(np.argmax(d), d.shape)
     ok = peak == (5, 7)
     print(f"  {'scale_down impulse centring':<34} {'PASS' if ok else 'FAIL'}  "
