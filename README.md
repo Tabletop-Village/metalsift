@@ -128,9 +128,47 @@ construction, since the append index is always `n + atomic_fetch_add`. The
 constraint that looked like the hardest part of the port turned out to remove
 the problem rather than create one.
 
-## Two upstream bugs fixed
+## Verified against upstream CudaSift
 
-Both are present in CudaSift and both are invisible on its own `img1.png`,
+Built from the same commit on an RTX 5070 (CUDA 13.3) and diffed keypoint for
+keypoint. Only two build patches were needed, neither touching an algorithm:
+`prop.memoryClockRate` was removed in CUDA 13, and `-arch=sm_35` had to become
+`sm_120`.
+
+| image | CudaSift | metalSIFT | matched | descriptor cosine |
+|---|---|---|---|---|
+| img1 | 2060 | 2061 | 99.95% | median 1.000000, p1 0.9988 |
+| img2 | 2244 | 2240 | 99.78% | median 1.000000, p1 0.9990 |
+| left | 1620 | 1616 | 99.57% | median 1.000000, p1 0.9987 |
+| righ | 2269 | 2269 | 99.87% | median 1.000000, p1 0.9992 |
+
+Counts agree within 0.25%, keypoints match on joint position-and-orientation to
+a maximum of 0.43 px (0.0013 px on `righ`), and better than 99.8% of matched
+descriptors have cosine above 0.99 against the CUDA original.
+
+The "CudaSift" column above is **corrected for the upstream counter bug
+below**. As shipped it reports 1911 / 2086 / 1453 / 2084.
+
+## Three upstream bugs
+
+All present in CudaSift, all confirmed by running it on real CUDA hardware.
+
+**The keypoint counter is read back one slot early.** `ExtractSift` reads
+`d_PointCounter[2*numOctaves]` (`cudaSiftH.cu:115`), but
+`ComputeOrientationsCONST` appends its secondary-orientation keypoints into
+`[2*octave+1]`. The final and largest octave's duplicates are therefore
+written into the buffer and never counted. Instrumenting the reference to dump
+its own histogram peaks showed 455 keypoints passing the
+`maxval2 > 0.8*maxval1` test on img1 while only 306 were reported — and
+455−306 = 149 is exactly the number of extra keypoints metalSIFT finds at
+subsampling 1.0. Changing the index to `2*numOctaves+1` moves upstream from
+1911 to 2060 against metalSIFT's 2061.
+
+metalSIFT never had this bug: per-octave buffers make the off-by-one
+unrepresentable. This is what the previously-unexplained "8% more keypoints"
+was.
+
+The other two are fixed here. Both are invisible on CudaSift's own `img1.png`,
 which is how they survived the original test pass.
 
 **Negative descriptor bins.** `ExtractSiftDescriptorsCONSTNew` scales by
@@ -142,6 +180,8 @@ for gradients within ~3e-5 rad of ±pi:
   negative — a negative weight is accumulated, surfacing as a descriptor bin
   around `-1e-6`. Harmless until something takes its square root; RootSIFT
   does, and gets NaN. Measured at 10 of 35375 descriptors across a mixed set.
+  Reproduced in upstream CudaSift on an RTX 5070: bins at `-1.2e-11` and
+  `-3.2e-11` on rotated inputs, likewise NaN under `sqrt`.
 * at +pi, `angf = 8.000118` gives `angi = 8`, so `p1 = angi + hbin` reaches
   128 and **writes past `threadgroup float buf[128]`**.
 
@@ -161,7 +201,11 @@ barrier it is 1.2e-07, one float32 ulp.
 Residual nondeterminism is real but harmless, and is inherent to the algorithm
 rather than to this port — CUDA's native shared-memory float `atomicAdd` is
 just as order-dependent as the CAS emulation here. End to end, two runs agree
-to 3e-05 per bin with cosine similarity 1.000000.
+to 3e-05 per bin with cosine similarity 1.000000. Upstream CudaSift on an
+RTX 5070 drifts by 9e-05 to 1e-04 between runs on identical input, so this
+port is now the more stable of the two. The race is undefined behaviour on
+both, but Apple's simdgroup scheduling exposes it far more aggressively
+(0.206 before the barrier) than NVIDIA's warp scheduling does.
 
 ## Deviations from CudaSift
 
@@ -274,8 +318,8 @@ entirely.
 
 ## How correctness was otherwise established
 
-There is no CUDA GPU here, so the port could not be diffed against CudaSift
-directly. Three further substitutes, all in `tests/`:
+These predate the upstream diff above and are what the port was built against;
+they are what `tests/` actually runs, since they need no CUDA hardware.
 
 1. **Scale-space vs. an independent NumPy reference** that reproduces the CUDA
    index arithmetic literally (clamped gathers, no convolution primitive).
@@ -298,7 +342,5 @@ tests, single-shot vs iterated subpixel refinement), and OpenCV finds 5303
 keypoints to our 2061. The warp repeatability number above is the meaningful
 comparison, and it favours this port.
 
-The one thing still unverified is agreement with CudaSift *itself*. Keypoint
-counts are 2061/2240 against the ~1911/2086 its README reports for this pair —
-about 8% more, direction and cause not established without a CUDA machine to
-diff against.
+All three were later corroborated by the direct diff against CudaSift on CUDA
+hardware, at the top of this file.
