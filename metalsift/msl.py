@@ -525,9 +525,24 @@ DESCRIPTORS = """
             int veri = (y + 2) / 4 - 1;
             float verf = (float(y) - 1.5f) / 4.0f - float(veri);
             float iverf = 1.0f - verf;
-            int angi = int(angf);
-            int angp = (angi < 7 ? angi + 1 : 0);
-            angf -= float(angi);
+            /* CudaSift scales by 4/3.1415 while FastAtan2 reflects about
+               3.14159274, so angf actually spans [-0.000118, 8.000118], not
+               [0, 8]. With C truncation that yields two defects at gradients
+               within ~3e-5 rad of +/-pi:
+                 angf = -1.18e-4 -> angi = 0, so angf stays negative and a
+                   negative weight is accumulated into the histogram, which
+                   surfaces as a descriptor bin around -1e-6;
+                 angf = 8.000118 -> angi = 8, so p1 = angi + hbin reaches 128
+                   and writes past buf[128].
+               floor plus a mask fixes both and is what the circular histogram
+               wanted anyway: bin 8 is bin 0, and bin -1 is bin 7. The upstream
+               constant is left alone -- it biases bin assignment by 2.4e-4 of
+               a bin, which is irrelevant, and changing it would perturb every
+               descriptor rather than just the broken ones. */
+            int angi = int(metal::floor(angf));
+            angf -= float(angi);              /* now strictly in [0, 1) */
+            angi &= 7;                        /* wrap 8 -> 0, -1 -> 7 */
+            int angp = (angi + 1) & 7;
             float iangf = 1.0f - angf;
 
             int hbin = 8 * (4 * veri + hori);
@@ -569,6 +584,14 @@ DESCRIPTORS = """
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float tsum1 = sums[0] + sums[1] + sums[2] + sums[3];
         tsum1 = metal::min(bval * metal::rsqrt(tsum1), 0.2f);
+
+        /* sums[] is about to be reused for the second reduction, and without
+           this barrier a simdgroup that has finished reading it can overwrite
+           sums[0] while another is still summing it for tsum1 -- giving that
+           simdgroup a corrupted normalisation factor. It made the kernel
+           nondeterministic to ~0.2 per bin on identical input. CudaSift has
+           the same missing sync at cudaSiftD.cu:397-404. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         s = simd_sum(tsum1 * tsum1);
         if ((idx & 31) == 0) sums[idx / 32] = s;

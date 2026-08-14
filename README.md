@@ -128,6 +128,41 @@ construction, since the append index is always `n + atomic_fetch_add`. The
 constraint that looked like the hardest part of the port turned out to remove
 the problem rather than create one.
 
+## Two upstream bugs fixed
+
+Both are present in CudaSift and both are invisible on its own `img1.png`,
+which is how they survived the original test pass.
+
+**Negative descriptor bins.** `ExtractSiftDescriptorsCONSTNew` scales by
+`4/3.1415` while `FastAtan2` reflects about `3.14159274`. That 0.003% mismatch
+maps the gradient angle onto `[-0.000118, 8.000118]` rather than `[0, 8]`, so
+for gradients within ~3e-5 rad of ±pi:
+
+* at −pi, `angf = -1.18e-4` and C truncation gives `angi = 0`, leaving `angf`
+  negative — a negative weight is accumulated, surfacing as a descriptor bin
+  around `-1e-6`. Harmless until something takes its square root; RootSIFT
+  does, and gets NaN. Measured at 10 of 35375 descriptors across a mixed set.
+* at +pi, `angf = 8.000118` gives `angi = 8`, so `p1 = angi + hbin` reaches
+  128 and **writes past `threadgroup float buf[128]`**.
+
+Fixed with `floor` plus a mask, which is what a circular histogram wanted
+anyway — bin 8 is bin 0, bin −1 is bin 7. The upstream constant is left alone:
+it biases bin assignment by 2.4e-4 of a bin, and changing it would perturb
+every descriptor instead of only the broken ones.
+
+**A missing threadgroup barrier.** The double normalisation reduces into
+`sums[4]` twice, and there is no barrier between reading `sums` for `tsum1` and
+overwriting it for the second reduction (`cudaSiftD.cu:397-404`). A simdgroup
+that finishes reading can clobber `sums[0]` while another is still summing it,
+corrupting that simdgroup's normalisation factor. This made the descriptor
+kernel nondeterministic to **0.206 per bin on identical input**; with the
+barrier it is 1.2e-07, one float32 ulp.
+
+Residual nondeterminism is real but harmless, and is inherent to the algorithm
+rather than to this port — CUDA's native shared-memory float `atomicAdd` is
+just as order-dependent as the CAS emulation here. End to end, two runs agree
+to 3e-05 per bin with cosine similarity 1.000000.
+
 ## Deviations from CudaSift
 
 - **Border keypoints are rejected.** `FindPointsMultiNew` reads one pixel

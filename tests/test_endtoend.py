@@ -121,6 +121,60 @@ def test_synthetic_warp(img):
     return err
 
 
+def test_numerics(im1):
+    """Regressions for two defects inherited from CudaSift.
+
+    Both were invisible on img1.png, which is why the original invariant check
+    passed: it only ever looked at one image.
+    """
+    print("numerical robustness")
+    h, w = im1.shape
+    variants = {"img1": im1.astype(np.float32)}
+    for deg in (60, 180):
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), deg, 1.0)
+        variants[f"rot{deg}"] = cv2.warpAffine(im1, M, (w, h)).astype(np.float32)
+    for n in ("left.pgm", "righ.pgm"):
+        p = os.path.join(DATA, n)
+        if os.path.exists(p):
+            variants[n] = cv2.imread(p, 0).astype(np.float32)
+
+    worst, total, bad = 0.0, 0, 0
+    for name, im in variants.items():
+        d = np.asarray(extract_sift(mx.array(im), 5, 1.0, 3.0)["desc"])
+        total += len(d)
+        bad += int((d < 0).any(axis=1).sum())
+        worst = min(worst, float(d.min()))
+    # A bin at -1e-6 is harmless until something takes its square root --
+    # RootSIFT does exactly that, and returns NaN.
+    report("no negative descriptor bins", bad == 0,
+           f"{bad}/{total} descriptors, min bin {worst:.3e}")
+    report("descriptors are sqrt-safe (RootSIFT)", worst >= 0.0,
+           f"sqrt(min) = {np.sqrt(worst) if worst >= 0 else float('nan')}")
+
+    # Determinism: the histogram atomics accumulate in nondeterministic order,
+    # so bit-equality is not achievable, but drift must stay at float32 noise.
+    from metalsift import msl
+    from metalsift import pyramid as P
+    img = mx.array(variants["img1"])
+    base = msl.lowpass(img, mx.array(P.lowpass_taps(1.0)))
+    mx.eval(base)
+    hh, ww = base.shape
+    lap = mx.array(P.laplace_taps(5, 0.0)[5])
+    dog = msl.laplace_multi(base, lap, ww, hh)
+    kp, cnt = msl.find_points(dog, ww, hh, 8192, 1.0, 0.0, 3.0, 0.2, 10.0)
+    kp7, tot = msl.compute_orientations(base, kp, cnt, ww, hh, 8192)
+    mx.eval(kp7, tot)
+    n = int(tot.item())
+    runs = []
+    for _ in range(6):
+        d = msl.descriptors(base, kp7, tot, ww, hh, 8192)
+        mx.eval(d)
+        runs.append(np.asarray(d)[:n].copy())
+    drift = max(np.abs(runs[0] - r).max() for r in runs[1:])
+    report("descriptor kernel deterministic to 1 ulp", drift < 1e-6,
+           f"max drift {drift:.3e} over 6 runs on identical input")
+
+
 def test_vs_opencv(s1, s2, im1, im2):
     print("agreement with OpenCV SIFT")
     sift = cv2.SIFT_create()
@@ -185,6 +239,7 @@ def main():
     print(f"extracted {s1['num']} and {s2['num']} keypoints\n")
 
     test_invariants(s1)
+    test_numerics(im1)
     test_self_match(s1)
     test_synthetic_warp(img1)
     test_vs_opencv(s1, s2, im1, im2)
